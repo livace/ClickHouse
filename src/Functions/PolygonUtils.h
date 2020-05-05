@@ -39,6 +39,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int LOGICAL_ERROR;
+    extern const int ILLEGAL_COLUMN;
 }
 
 
@@ -647,6 +648,66 @@ std::string serialize(Polygon && polygon)
         serializeRing(inner);
 
     return buffer.str();
+}
+
+template <typename Polygon>
+Polygon parsePolygonFromColumn(IColumn & poly, size_t i, const std::string& error_prefix)
+{
+    const auto * column_const = checkAndGetColumn<ColumnConst>(poly);
+    const auto * array_col =
+        column_const ? checkAndGetColumn<ColumnArray>(column_const->getDataColumn()) : checkAndGetColumn<ColumnArray>(poly);
+    const auto * nested_array_col = array_col ? checkAndGetColumn<ColumnArray>(array_col->getData()) : nullptr;
+    if (!nested_array_col)
+        throw Exception(error_prefix + " must contain an array of tuples or an array of arrays of tuples",
+                        ErrorCodes::ILLEGAL_COLUMN);
+
+    const auto & tuple_data = nested_array_col ? nested_array_col->getData() : array_col->getData();
+    const auto & tuple_col = checkAndGetColumn<ColumnTuple>(tuple_data);
+    if (!tuple_col)
+        throw Exception(error_prefix + " must contain an array of tuples or an array of arrays of tuples",
+                        ErrorCodes::ILLEGAL_COLUMN);
+
+    const auto & tuple_columns = tuple_col->getColumns();
+    const auto & x_column = tuple_columns[0];
+    const auto & y_column = tuple_columns[1];
+
+    auto parse_polygon_part = [&x_column, &y_column](auto & container, size_t l, size_t r)
+    {
+        for (auto j : ext::range(l, r))
+        {
+            CoordinateType x_coord = x_column->getFloat64(j);
+            CoordinateType y_coord = y_column->getFloat64(j);
+
+            container.push_back(Point(x_coord, y_coord));
+        }
+    };
+
+    Polygon polygon;
+    {
+        for (auto j : ext::range(array_col->getOffsets()[i - 1], array_col->getOffsets()[i]))
+        {
+            size_t l = nested_array_col->getOffsets()[j - 1];
+            size_t r = nested_array_col->getOffsets()[j];
+            if (polygon.outer().empty())
+            {
+                parse_polygon_part(polygon.outer(), l, r);
+            }
+            else
+            {
+                polygon.inners().emplace_back();
+                parse_polygon_part(polygon.inners().back(), l, r);
+            }
+        }
+    }
+    else
+    {
+        size_t l = array_col->getOffsets()[i - 1];
+        size_t r = array_col->getOffsets()[i];
+
+        parse_polygon_part(polygon.outer(), l, r);
+    }
+
+    return polygon;
 }
 
 }
